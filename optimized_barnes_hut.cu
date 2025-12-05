@@ -56,7 +56,7 @@ __global__ void resetAccelerations(Body* bodies, int n_bodies) {
 
 // Kernel: Barnes-Hut force calculation with shared memory tiling
 __global__ void computeBarnesHutForcesTiled(Body* bodies, OctreeNode* tree, 
-                                            int n_bodies, int tree_size) {
+                                            int n_bodies, int tree_size, float G, float THETA, float SOFTENING) {
     extern __shared__ BodyTile shared_tile[];
     
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -486,7 +486,7 @@ int main() {
         // Calculate forces with shared memory tiling
         size_t shared_mem_size = BLOCK_SIZE * sizeof(BodyTile);
         computeBarnesHutForcesTiled<<<grid_size, BLOCK_SIZE, shared_mem_size>>>(
-            d_bodies, d_tree, N_BODIES, tree_size);
+            d_bodies, d_tree, N_BODIES, tree_size, G, THETA, SOFTENING);
         cudaDeviceSynchronize();
         
         updateBodies<<<grid_size, BLOCK_SIZE>>>(d_bodies, N_BODIES, DT);
