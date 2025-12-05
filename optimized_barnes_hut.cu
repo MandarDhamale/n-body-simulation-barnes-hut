@@ -467,7 +467,7 @@ int main() {
         total_time += step_time;
         
         // Output progress
-        if (step % 1 == 0) {
+        if (step % 10 == 0) {
             // Bodies are already on host from step B (approximate) or we can copy fresh
             // Ideally copy fresh if we want exact viz, but for speed we can skip strict sync
             cudaMemcpy(h_bodies, d_bodies, N_BODIES * sizeof(Body), cudaMemcpyDeviceToHost); 
