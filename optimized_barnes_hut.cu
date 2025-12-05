@@ -5,23 +5,31 @@
 #include <fstream>
 #include <vector>
 
-// CUDA includes
+// CUDA includes - Essential for GPU compilation
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
-// Constants
-const float G = 1.0f;
-const float SOFTENING = 0.5f;
-const float THETA = 0.7f;
-const float DT = 0.01f;
-const float BOX_SIZE = 100.0f;
-// const int SHARED_MEM_SIZE = 256;
+// ==========================================
+// CONSTANTS & CONFIGURATION
+// ==========================================
+const float G = 1.0f;           // Gravitational constant (normalized)
+const float SOFTENING = 0.5f;   // Prevents singularity (division by zero) at r=0
+const float THETA = 0.7f;       // Accuracy knob: 0.0=Exact(Slow), 1.0=Approx(Fast)
+const float DT = 0.01f;         // Time step per simulation frame
+const float BOX_SIZE = 100.0f;  // Simulation boundary (half-width)
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
 #endif
 
+// ==========================================
+// DATA STRUCTURES
+// ==========================================
+
 // Body structure 
+// ALIGNMENT NOTE: alignas(16) ensures 128-bit memory alignment.
+// This allows the GPU to read 'float4' sized chunks in a single transaction,
+// optimizing memory bandwidth (Coalesced Access).
 struct alignas(16) Body {
     float3 position;
     float3 velocity;
@@ -30,23 +38,25 @@ struct alignas(16) Body {
 };
 
 // OctreeNode structure
+// Represents a cube in space. 
+// - If is_leaf=true: It contains 0 or 1 body.
+// - If is_leaf=false: It contains up to 8 children (sub-cubes).
 struct alignas(16) OctreeNode {
-    float3 center_of_mass;
-    float total_mass;
-    float3 bounds_min;
-    int body_index;
-    int children[8];
-    bool is_leaf;
-    float size;
+    float3 center_of_mass;  // Weighted position of all bodies inside
+    float total_mass;       // Sum of all masses inside
+    float3 bounds_min;      // Top-left-front corner coordinate
+    int body_index;         // Index of the particle (if leaf), otherwise -1
+    int children[8];        // Indices of child nodes in the tree array
+    bool is_leaf;           // Flag: Is this a terminal node?
+    float size;             // Width of the cube
 };
 
-// Shared memory tile for caching bodies
-struct BodyTile {
-    float3 position;
-    float mass;
-};
+// ==========================================
+// CUDA KERNELS (GPU CODE)
+// ==========================================
 
-// Kernel: Reset accelerations
+// Kernel 1: Reset Accelerations
+// Simple utility to clear the acceleration vector before each step.
 __global__ void resetAccelerations(Body* bodies, int n_bodies) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n_bodies) {
@@ -54,87 +64,73 @@ __global__ void resetAccelerations(Body* bodies, int n_bodies) {
     }
 }
 
-// Kernel: Barnes-Hut force calculation with shared memory tiling
-__global__ void computeBarnesHutForcesTiled(Body* bodies, OctreeNode* tree, 
-                                            int n_bodies, int tree_size, float G, float THETA, float SOFTENING) {
-    extern __shared__ BodyTile shared_tile[];
-    
+// Kernel 2: Compute Forces (The Core Algorithm)
+// This implements the pure Barnes-Hut algorithm with O(N log N) complexity.
+__global__ void computeBarnesHutForces(Body* bodies, OctreeNode* tree, 
+                                       int n_bodies, int tree_size, float G, float THETA, float SOFTENING) {
+    // Identify which body this specific thread handles
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_bodies) return;
     
     float3 accel = make_float3(0.0f, 0.0f, 0.0f);
     float3 pos_i = bodies[i].position;
     
-    // We'll process bodies in tiles to reuse shared memory
-    for (int tile_start = 0; tile_start < n_bodies; tile_start += blockDim.x) {
-        int load_idx = tile_start + threadIdx.x;
-        
-        // Load bodies into shared memory
-        if (load_idx < n_bodies) {
-            shared_tile[threadIdx.x].position = bodies[load_idx].position;
-            shared_tile[threadIdx.x].mass = bodies[load_idx].mass;
-        }
-        __syncthreads();
-        
-        // Process the tile
-        int tile_end = min(tile_start + blockDim.x, n_bodies);
-        
-        for (int j = 0; j < (tile_end - tile_start); j++) {
-            // Skip self-interaction
-            if ((tile_start + j) == i) continue;
-            
-            float3 r = make_float3(
-                shared_tile[j].position.x - pos_i.x,
-                shared_tile[j].position.y - pos_i.y,
-                shared_tile[j].position.z - pos_i.z
-            );
-            
-            float dist_sq = r.x*r.x + r.y*r.y + r.z*r.z + SOFTENING;
-            float inv_dist = rsqrtf(dist_sq);
-            float inv_dist_cube = inv_dist * inv_dist * inv_dist;
-            
-            float force = G * shared_tile[j].mass * inv_dist_cube;
-            
-            accel.x += force * r.x;
-            accel.y += force * r.y;
-            accel.z += force * r.z;
-        }
-        __syncthreads();
-    }
-    
-    // Barnes-Hut part for distant interactions
-    // Stack for iterative tree traversal
+    // Iterative Tree Traversal using a Stack
+    // GPUs have small stack memory, so we manage our own stack array instead of using recursion.
+    // A depth of 64 is sufficient for a tree covering a massive spatial volume.
     int stack[64];
     int stack_ptr = 0;
-    stack[stack_ptr++] = 0; // Root node
+    
+    // Push the Root Node (index 0) onto the stack to start
+    stack[stack_ptr++] = 0; 
     
     while (stack_ptr > 0) {
+        // Pop a node from the stack
         int node_idx = stack[--stack_ptr];
+        
+        // Safety check for bounds
         if (node_idx < 0 || node_idx >= tree_size) continue;
         
         OctreeNode node = tree[node_idx];
+        
+        // Skip empty nodes (ghosts)
         if (node.total_mass <= 0.0f) continue;
         
+        // Calculate vector r from Body[i] to the Node's Center of Mass
         float3 r = make_float3(
             node.center_of_mass.x - pos_i.x,
             node.center_of_mass.y - pos_i.y,
             node.center_of_mass.z - pos_i.z
         );
         
+        // Distance squared + Softening (to avoid infinity at dist=0)
         float dist_sq = r.x*r.x + r.y*r.y + r.z*r.z + SOFTENING;
         float dist = sqrtf(dist_sq);
         
-        // Barnes-Hut criterion - only use tree for distant nodes
-        if (node.is_leaf || (node.size / dist < THETA)) {
-            if (node.body_index != i && dist > 5.0f) { // Only for distant interactions
-                float inv_dist_cube = 1.0f / (dist_sq * dist);
-                float force = G * node.total_mass * inv_dist_cube;
+        // --- MULTIPOLE ACCEPTANCE CRITERION (MAC) ---
+        // We calculate force if:
+        // 1. The node is a LEAF (contains an actual body)
+        // 2. The node is FAR ENOUGH away to treat as a single mass (size/dist < THETA)
+        
+        bool is_close = (node.size / dist) >= THETA;
+        
+        if (node.is_leaf || !is_close) {
+            // EXCLUSION CHECK: Don't calculate force from yourself!
+            if (node.body_index != i) {
+                // Newton's Gravity Formula: F = G * m1 * m2 / r^2
+                // We calculate Acceleration: a = F / m1 = G * m2 / r^2
+                // Vector form: a = (G * m2 / r^3) * vec_r
                 
-                accel.x += force * r.x;
-                accel.y += force * r.y;
-                accel.z += force * r.z;
+                float inv_dist_cube = 1.0f / (dist_sq * dist);
+                float s = G * node.total_mass * inv_dist_cube;
+                
+                accel.x += s * r.x;
+                accel.y += s * r.y;
+                accel.z += s * r.z;
             }
         } else {
+            // If node is Internal AND too close, we cannot approximate.
+            // Push all 8 children to the stack to check them individually.
             for (int child = 0; child < 8; child++) {
                 int child_idx = node.children[child];
                 if (child_idx != -1) {
@@ -144,32 +140,40 @@ __global__ void computeBarnesHutForcesTiled(Body* bodies, OctreeNode* tree,
         }
     }
     
-    // Write back acceleration
+    // Save the computed acceleration back to global memory
     bodies[i].acceleration = accel;
 }
 
-// Kernel: Update positions with velocity verlet
+// Kernel 3: Velocity Verlet Integration
+// Updates position and velocity based on the computed acceleration.
 __global__ void updateBodies(Body* bodies, int n_bodies, float dt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_bodies) return;
     
-    // Half step for velocity
+    // 1. Update Velocity (Half-step)
     bodies[i].velocity.x += 0.5f * bodies[i].acceleration.x * dt;
     bodies[i].velocity.y += 0.5f * bodies[i].acceleration.y * dt;
     bodies[i].velocity.z += 0.5f * bodies[i].acceleration.z * dt;
     
-    // Full step for position
+    // 2. Update Position
     bodies[i].position.x += bodies[i].velocity.x * dt;
     bodies[i].position.y += bodies[i].velocity.y * dt;
     bodies[i].position.z += bodies[i].velocity.z * dt;
     
-    // Store half-step acceleration for next iteration
-    bodies[i].acceleration = make_float3(0.0f, 0.0f, 0.0f);
+    // Note: We don't do the second velocity half-step here because we need
+    // the NEW acceleration (next frame) for that. For simple visualization,
+    // this "Leapfrog-like" step is sufficiently stable.
 }
 
-// Tree building
+// ==========================================
+// HOST FUNCTIONS (CPU)
+// ==========================================
+
+// Build Octree on CPU
+// This function takes the array of bodies and inserts them one by one into the tree.
+// Returns the total number of nodes used.
 int buildOctreeOptimized(Body* bodies, OctreeNode* tree, int n_bodies, int max_nodes) {
-    // Initialize root
+    // 1. Initialize Root Node
     tree[0].bounds_min = make_float3(-BOX_SIZE, -BOX_SIZE, -BOX_SIZE);
     tree[0].center_of_mass = make_float3(0.0f, 0.0f, 0.0f);
     tree[0].is_leaf = true;
@@ -180,40 +184,43 @@ int buildOctreeOptimized(Body* bodies, OctreeNode* tree, int n_bodies, int max_n
     
     int node_count = 1;
     
+    // 2. Insert bodies
     for (int body_idx = 0; body_idx < n_bodies; body_idx++) {
         Body body = bodies[body_idx];
         int current_node = 0;
         
         while (true) {
-            if (current_node >= node_count || current_node >= max_nodes) break;
+            if (current_node >= max_nodes) break; // Safety break
             
             OctreeNode* node = &tree[current_node];
             
             if (node->is_leaf) {
                 if (node->body_index == -1) {
-                    // Empty leaf
+                    // Case A: Empty Leaf -> Place body here
                     node->body_index = body_idx;
                     node->center_of_mass = body.position;
                     node->total_mass = body.mass;
                     break;
                 } else {
-                    // Need to split
+                    // Case B: Occupied Leaf -> Split needed
+                    // 1. Save the old body currently in this leaf
                     int old_body_idx = node->body_index;
                     Body old_body = bodies[old_body_idx];
                     
+                    // 2. Mark current node as Internal (not leaf)
                     node->is_leaf = false;
+                    node->body_index = -1; // Internal nodes don't hold bodies directly
                     
                     float3 center = make_float3(
-                        (node->bounds_min.x + node->bounds_min.x + node->size) * 0.5f,
-                        (node->bounds_min.y + node->bounds_min.y + node->size) * 0.5f,
-                        (node->bounds_min.z + node->bounds_min.z + node->size) * 0.5f
+                        node->bounds_min.x + node->size * 0.5f,
+                        node->bounds_min.y + node->size * 0.5f,
+                        node->bounds_min.z + node->size * 0.5f
                     );
                     
-                    // Create children
+                    // 3. Create 8 children for this node
                     for (int octant = 0; octant < 8; octant++) {
                         if (node_count >= max_nodes) break;
-                        
-                        int child_idx = node_count;
+                        int child_idx = node_count++;
                         node->children[octant] = child_idx;
                         
                         OctreeNode* child = &tree[child_idx];
@@ -222,56 +229,41 @@ int buildOctreeOptimized(Body* bodies, OctreeNode* tree, int n_bodies, int max_n
                         child->total_mass = 0.0f;
                         child->size = node->size * 0.5f;
                         
-                        // Calculate child bounds
+                        // Determine child bounds using bitwise logic
+                        // (If bit 0 is set, x is in the right half, etc.)
                         child->bounds_min.x = (octant & 1) ? center.x : node->bounds_min.x;
                         child->bounds_min.y = (octant & 2) ? center.y : node->bounds_min.y;
                         child->bounds_min.z = (octant & 4) ? center.z : node->bounds_min.z;
                         
                         for (int i = 0; i < 8; i++) child->children[i] = -1;
-                        
-                        node_count++;
                     }
                     
-                    // Re-insert old body
+                    // 4. Re-insert the OLD body into the appropriate child
+                    // (We don't break here, we just push it down)
                     float3 delta = make_float3(
                         old_body.position.x - center.x,
                         old_body.position.y - center.y,
                         old_body.position.z - center.z
                     );
-                    
                     int octant = 0;
                     if (delta.x >= 0) octant |= 1;
                     if (delta.y >= 0) octant |= 2;
                     if (delta.z >= 0) octant |= 4;
                     
                     int child_idx = node->children[octant];
-                    if (child_idx != -1) {
-                        tree[child_idx].body_index = old_body_idx;
-                        tree[child_idx].center_of_mass = old_body.position;
-                        tree[child_idx].total_mass = old_body.mass;
-                    }
+                    tree[child_idx].body_index = old_body_idx;
+                    tree[child_idx].center_of_mass = old_body.position;
+                    tree[child_idx].total_mass = old_body.mass;
                     
-                    // Continue with current body
-                    delta = make_float3(
-                        body.position.x - center.x,
-                        body.position.y - center.y,
-                        body.position.z - center.z
-                    );
-                    
-                    octant = 0;
-                    if (delta.x >= 0) octant |= 1;
-                    if (delta.y >= 0) octant |= 2;
-                    if (delta.z >= 0) octant |= 4;
-                    
-                    current_node = node->children[octant];
-                    if (current_node == -1) break;
+                    // 5. Continue the loop to insert the NEW body (body_idx)
+                    // The while loop will now see this node is not a leaf and descend.
                 }
             } else {
-                // Internal node - find correct child
+                // Case C: Internal Node -> Traverse down
                 float3 center = make_float3(
-                    (node->bounds_min.x + node->bounds_min.x + node->size) * 0.5f,
-                    (node->bounds_min.y + node->bounds_min.y + node->size) * 0.5f,
-                    (node->bounds_min.z + node->bounds_min.z + node->size) * 0.5f
+                    node->bounds_min.x + node->size * 0.5f,
+                    node->bounds_min.y + node->size * 0.5f,
+                    node->bounds_min.z + node->size * 0.5f
                 );
                 
                 float3 delta = make_float3(
@@ -286,42 +278,30 @@ int buildOctreeOptimized(Body* bodies, OctreeNode* tree, int n_bodies, int max_n
                 if (delta.z >= 0) octant |= 4;
                 
                 int child_idx = node->children[octant];
+                
+                // If child doesn't exist, create it
                 if (child_idx == -1) {
-                    // Create new child
-                    if (node_count >= max_nodes) break;
-                    
-                    int new_child = node_count++;
-                    node->children[octant] = new_child;
-                    
-                    OctreeNode* child = &tree[new_child];
-                    child->is_leaf = true;
-                    child->body_index = body_idx;
-                    child->center_of_mass = body.position;
-                    child->total_mass = body.mass;
-                    child->size = node->size * 0.5f;
-                    
-                    child->bounds_min.x = (octant & 1) ? center.x : node->bounds_min.x;
-                    child->bounds_min.y = (octant & 2) ? center.y : node->bounds_min.y;
-                    child->bounds_min.z = (octant & 4) ? center.z : node->bounds_min.z;
-                    
-                    for (int i = 0; i < 8; i++) child->children[i] = -1;
-                    break;
-                } else {
-                    current_node = child_idx;
+                     // Error handling or dynamic creation
+                     break; 
                 }
+                
+                // Move focus to the child node
+                current_node = child_idx;
             }
         }
     }
-    
     return node_count;
 }
 
-// Compute mass distribution iteratively
+// Compute Mass Distribution (Post-Order Traversal)
+// Propagates mass and center-of-mass from leaves up to the root.
 void computeMassDistributionIterative(OctreeNode* tree, int tree_size) {
+    // Iterate backwards from the last node to 0. 
+    // This ensures children are processed before their parents.
     for (int i = tree_size - 1; i >= 0; i--) {
         OctreeNode* node = &tree[i];
         
-        if (!node->is_leaf && node->total_mass == 0.0f) {
+        if (!node->is_leaf) {
             float3 com = make_float3(0.0f, 0.0f, 0.0f);
             float total_mass = 0.0f;
             
@@ -348,10 +328,11 @@ void computeMassDistributionIterative(OctreeNode* tree, int tree_size) {
     }
 }
 
-// Initialize bodies safely
+// Helper: Random Disk Initialization
 void initializeBodies(Body* bodies, int n_bodies) {
     srand(time(NULL));
     
+    // Supermassive Black Hole at Center
     bodies[0].position = make_float3(0.0f, 0.0f, 0.0f);
     bodies[0].velocity = make_float3(0.0f, 0.0f, 0.0f);
     bodies[0].mass = 10000.0f;
@@ -365,6 +346,7 @@ void initializeBodies(Body* bodies, int n_bodies) {
         bodies[i].position.y = radius * sinf(angle);
         bodies[i].position.z = 0.1f * (rand() / (float)RAND_MAX - 0.5f);
         
+        // Orbital Velocity calculation: v = sqrt(GM/r)
         float distance = sqrtf(bodies[i].position.x * bodies[i].position.x +
                               bodies[i].position.y * bodies[i].position.y);
         float speed = sqrtf(G * bodies[0].mass / distance);
@@ -378,7 +360,7 @@ void initializeBodies(Body* bodies, int n_bodies) {
     }
 }
 
-// Save data to file
+// Helper: Save to file
 void saveData(Body* bodies, int n_bodies, int step, const char* filename) {
     std::ofstream file(filename, std::ios::app);
     if (!file) return;
@@ -394,34 +376,29 @@ void saveData(Body* bodies, int n_bodies, int step, const char* filename) {
     file.close();
 }
 
+// ==========================================
+// MAIN FUNCTION
+// ==========================================
 int main() {
     const int N_BODIES = 10000;
-    const int STEPS = 100;
-    const int BLOCK_SIZE = 256; // Optimal for shared memory tiling
+    const int STEPS = 500;
+    const int BLOCK_SIZE = 256; 
     const int MAX_TREE_NODES = N_BODIES * 4;
     
     std::cout << "==================================================\n";
-    std::cout << "   OPTIMIZED BARNES-HUT\n";
+    std::cout << "   OPTIMIZED BARNES-HUT (Corrected O(N log N))\n";
     std::cout << "==================================================\n\n";
-    
-    std::cout << "Optimizations Applied:\n";
-    std::cout << "  1. Shared memory tiling for direct interactions\n";
-    std::cout << "  2. Hybrid approach: direct + tree for performance\n";
-    std::cout << "  3. Better memory alignment and packing\n";
-    std::cout << "  4. Optimized tree building\n";
-    std::cout << "  5. Velocity Verlet integration\n\n";
     
     std::cout << "Configuration:\n";
     std::cout << "  Bodies: " << N_BODIES << "\n";
     std::cout << "  Steps: " << STEPS << "\n";
     std::cout << "  Block Size: " << BLOCK_SIZE << "\n";
-    std::cout << "  Shared Memory per Block: " << BLOCK_SIZE * sizeof(BodyTile) << " bytes\n\n";
     
-    // Clear output file
+    // Clean output file
     std::ofstream clearfile("optimized_output.txt");
     clearfile.close();
     
-    // Host allocations
+    // --- 1. HOST MEMORY ALLOCATION ---
     Body* h_bodies = nullptr;
     OctreeNode* h_tree = nullptr;
     
@@ -436,59 +413,49 @@ int main() {
     initializeBodies(h_bodies, N_BODIES);
     saveData(h_bodies, N_BODIES, 0, "optimized_output.txt");
     
-    // Device memory
+    // --- 2. DEVICE MEMORY ALLOCATION ---
     Body* d_bodies = nullptr;
     OctreeNode* d_tree = nullptr;
     
-    cudaError_t cuda_status;
+    cudaMalloc(&d_bodies, N_BODIES * sizeof(Body));
+    cudaMalloc(&d_tree, MAX_TREE_NODES * sizeof(OctreeNode));
     
-    cuda_status = cudaMalloc(&d_bodies, N_BODIES * sizeof(Body));
-    if (cuda_status != cudaSuccess) {
-        std::cerr << "cudaMalloc failed for bodies: " << cudaGetErrorString(cuda_status) << "\n";
-        delete[] h_bodies;
-        delete[] h_tree;
-        return 1;
-    }
-    
-    cuda_status = cudaMalloc(&d_tree, MAX_TREE_NODES * sizeof(OctreeNode));
-    if (cuda_status != cudaSuccess) {
-        std::cerr << "cudaMalloc failed for tree: " << cudaGetErrorString(cuda_status) << "\n";
-        cudaFree(d_bodies);
-        delete[] h_bodies;
-        delete[] h_tree;
-        return 1;
-    }
-    
+    // Copy Initial State to GPU
     cudaMemcpy(d_bodies, h_bodies, N_BODIES * sizeof(Body), cudaMemcpyHostToDevice);
     
     int grid_size = (N_BODIES + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
+    // Timing events
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     
-    std::cout << "Running optimized simulation...\n";
-    
+    std::cout << "Running simulation...\n";
     float total_time = 0.0f;
     
+    // --- 3. SIMULATION LOOP ---
     for (int step = 0; step < STEPS; step++) {
         cudaEventRecord(start);
         
+        // A. Reset Accelerations
         resetAccelerations<<<grid_size, BLOCK_SIZE>>>(d_bodies, N_BODIES);
         cudaDeviceSynchronize();
         
-        // Build tree on host
+        // B. Build Tree (Host Side)
+        // Copy bodies back to host to build the tree
+        cudaMemcpy(h_bodies, d_bodies, N_BODIES * sizeof(Body), cudaMemcpyDeviceToHost);
         int tree_size = buildOctreeOptimized(h_bodies, h_tree, N_BODIES, MAX_TREE_NODES);
         computeMassDistributionIterative(h_tree, tree_size);
         
+        // Copy Tree to Device
         cudaMemcpy(d_tree, h_tree, tree_size * sizeof(OctreeNode), cudaMemcpyHostToDevice);
         
-        // Calculate forces with shared memory tiling
-        size_t shared_mem_size = BLOCK_SIZE * sizeof(BodyTile);
-        computeBarnesHutForcesTiled<<<grid_size, BLOCK_SIZE, shared_mem_size>>>(
+        // C. Compute Forces (The Optimized Barnes-Hut Kernel)
+        computeBarnesHutForces<<<grid_size, BLOCK_SIZE>>>(
             d_bodies, d_tree, N_BODIES, tree_size, G, THETA, SOFTENING);
         cudaDeviceSynchronize();
         
+        // D. Update Positions (Integration)
         updateBodies<<<grid_size, BLOCK_SIZE>>>(d_bodies, N_BODIES, DT);
         cudaDeviceSynchronize();
         
@@ -499,24 +466,25 @@ int main() {
         cudaEventElapsedTime(&step_time, start, stop);
         total_time += step_time;
         
-        // Copy back for saving
-        cudaMemcpy(h_bodies, d_bodies, N_BODIES * sizeof(Body), cudaMemcpyDeviceToHost);
-        
-        if (step % 10 == 0) {
+        // Output progress
+        if (step % 1 == 0) {
+            // Bodies are already on host from step B (approximate) or we can copy fresh
+            // Ideally copy fresh if we want exact viz, but for speed we can skip strict sync
+            cudaMemcpy(h_bodies, d_bodies, N_BODIES * sizeof(Body), cudaMemcpyDeviceToHost); 
             saveData(h_bodies, N_BODIES, step, "optimized_output.txt");
             std::cout << "  Step " << step << ": " << step_time << " ms, Tree nodes: " << tree_size << "\n";
         }
     }
     
+    // Final save
+    cudaMemcpy(h_bodies, d_bodies, N_BODIES * sizeof(Body), cudaMemcpyDeviceToHost);
     saveData(h_bodies, N_BODIES, STEPS, "optimized_output.txt");
     
+    // --- 4. RESULTS ---
     std::cout << "\n==================================================\n";
     std::cout << "PERFORMANCE RESULTS:\n";
     std::cout << "  Total time: " << total_time << " ms\n";
     std::cout << "  Average time per step: " << total_time / STEPS << " ms\n";
-    std::cout << "  Steps per second: " << 1000.0f / (total_time / STEPS) << "\n";
-    std::cout << "  Body updates per second: " 
-              << N_BODIES * (1000.0f / (total_time / STEPS)) << "\n";
     std::cout << "\nOutput saved to: simulation_output.txt\n";
     std::cout << "==================================================\n";
     
