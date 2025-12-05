@@ -380,7 +380,7 @@ void saveData(Body* bodies, int n_bodies, int step, const char* filename) {
 // MAIN FUNCTION
 // ==========================================
 int main() {
-    const int N_BODIES = 10000;
+    const int N_BODIES = 5000;
     const int STEPS = 250;
     const int BLOCK_SIZE = 256; 
     const int MAX_TREE_NODES = N_BODIES * 4;
