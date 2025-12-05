@@ -21,7 +21,7 @@ const float BOX_SIZE = 100.0f;
 #define M_PI 3.14159265358979323846f
 #endif
 
-// Body structure - packed for better memory coalescing
+// Body structure 
 struct alignas(16) Body {
     float3 position;
     float3 velocity;
@@ -29,7 +29,7 @@ struct alignas(16) Body {
     float mass;
 };
 
-// Optimized OctreeNode structure - smaller for better caching
+// OctreeNode structure
 struct alignas(16) OctreeNode {
     float3 center_of_mass;
     float total_mass;
@@ -54,7 +54,7 @@ __global__ void resetAccelerations(Body* bodies, int n_bodies) {
     }
 }
 
-// Optimized Kernel: Barnes-Hut force calculation with shared memory tiling
+// Kernel: Barnes-Hut force calculation with shared memory tiling
 __global__ void computeBarnesHutForcesTiled(Body* bodies, OctreeNode* tree, 
                                             int n_bodies, int tree_size) {
     extern __shared__ BodyTile shared_tile[];
@@ -148,7 +148,7 @@ __global__ void computeBarnesHutForcesTiled(Body* bodies, OctreeNode* tree,
     bodies[i].acceleration = accel;
 }
 
-// Kernel: Update positions with velocity verlet (more stable)
+// Kernel: Update positions with velocity verlet
 __global__ void updateBodies(Body* bodies, int n_bodies, float dt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_bodies) return;
@@ -167,7 +167,7 @@ __global__ void updateBodies(Body* bodies, int n_bodies, float dt) {
     bodies[i].acceleration = make_float3(0.0f, 0.0f, 0.0f);
 }
 
-// Optimized tree building with better memory layout
+// Tree building
 int buildOctreeOptimized(Body* bodies, OctreeNode* tree, int n_bodies, int max_nodes) {
     // Initialize root
     tree[0].bounds_min = make_float3(-BOX_SIZE, -BOX_SIZE, -BOX_SIZE);
@@ -316,7 +316,7 @@ int buildOctreeOptimized(Body* bodies, OctreeNode* tree, int n_bodies, int max_n
     return node_count;
 }
 
-// Compute mass distribution iteratively (faster)
+// Compute mass distribution iteratively
 void computeMassDistributionIterative(OctreeNode* tree, int tree_size) {
     for (int i = tree_size - 1; i >= 0; i--) {
         OctreeNode* node = &tree[i];
@@ -348,7 +348,7 @@ void computeMassDistributionIterative(OctreeNode* tree, int tree_size) {
     }
 }
 
-// Initialize bodies safely - Same as original
+// Initialize bodies safely
 void initializeBodies(Body* bodies, int n_bodies) {
     srand(time(NULL));
     
@@ -378,7 +378,7 @@ void initializeBodies(Body* bodies, int n_bodies) {
     }
 }
 
-// Save data to file - Same as original
+// Save data to file
 void saveData(Body* bodies, int n_bodies, int step, const char* filename) {
     std::ofstream file(filename, std::ios::app);
     if (!file) return;
@@ -395,13 +395,13 @@ void saveData(Body* bodies, int n_bodies, int step, const char* filename) {
 }
 
 int main() {
-    const int N_BODIES = 2048;
+    const int N_BODIES = 10000;
     const int STEPS = 100;
     const int BLOCK_SIZE = 256; // Optimal for shared memory tiling
     const int MAX_TREE_NODES = N_BODIES * 4;
     
     std::cout << "==================================================\n";
-    std::cout << "   OPTIMIZED BARNES-HUT WITH SHARED MEMORY TILING\n";
+    std::cout << "   OPTIMIZED BARNES-HUT\n";
     std::cout << "==================================================\n\n";
     
     std::cout << "Optimizations Applied:\n";
