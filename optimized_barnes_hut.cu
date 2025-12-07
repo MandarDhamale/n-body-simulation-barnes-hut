@@ -5,7 +5,7 @@
 #include <fstream>
 #include <vector>
 
-// CUDA includes - Essential for GPU compilation
+// CUDA includes
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
@@ -64,8 +64,7 @@ __global__ void resetAccelerations(Body* bodies, int n_bodies) {
     }
 }
 
-// Kernel 2: Compute Forces (The Core Algorithm)
-// This implements the pure Barnes-Hut algorithm with O(N log N) complexity.
+// Kernel 2: Compute Forces using Barnes-Hut
 __global__ void computeBarnesHutForces(Body* bodies, OctreeNode* tree, 
                                        int n_bodies, int tree_size, float G, float THETA, float SOFTENING) {
     // Identify which body this specific thread handles
@@ -93,7 +92,7 @@ __global__ void computeBarnesHutForces(Body* bodies, OctreeNode* tree,
         
         OctreeNode node = tree[node_idx];
         
-        // Skip empty nodes (ghosts)
+        // Skip empty nodes 
         if (node.total_mass <= 0.0f) continue;
         
         // Calculate vector r from Body[i] to the Node's Center of Mass
@@ -115,7 +114,7 @@ __global__ void computeBarnesHutForces(Body* bodies, OctreeNode* tree,
         bool is_close = (node.size / dist) >= THETA;
         
         if (node.is_leaf || !is_close) {
-            // EXCLUSION CHECK: Don't calculate force from yourself!
+            // EXCLUSION CHECK: Don't calculate force from yourself
             if (node.body_index != i) {
                 // Newton's Gravity Formula: F = G * m1 * m2 / r^2
                 // We calculate Acceleration: a = F / m1 = G * m2 / r^2
@@ -160,9 +159,6 @@ __global__ void updateBodies(Body* bodies, int n_bodies, float dt) {
     bodies[i].position.y += bodies[i].velocity.y * dt;
     bodies[i].position.z += bodies[i].velocity.z * dt;
     
-    // Note: We don't do the second velocity half-step here because we need
-    // the NEW acceleration (next frame) for that. For simple visualization,
-    // this "Leapfrog-like" step is sufficiently stable.
 }
 
 // ==========================================
@@ -380,13 +376,13 @@ void saveData(Body* bodies, int n_bodies, int step, const char* filename) {
 // MAIN FUNCTION
 // ==========================================
 int main() {
-    const int N_BODIES = 5000;
-    const int STEPS = 250;
+    const int N_BODIES = 2000; // Number of bodies in the simulation, using 2000 for project submission to reduce project size, change to 7000 for full simulation, or any other value
+    const int STEPS = 150;       // Number of simulation steps, using 150 for project submission to reduce project size, change to 1000 for full simulation
     const int BLOCK_SIZE = 256; 
     const int MAX_TREE_NODES = N_BODIES * 4;
     
     std::cout << "==================================================\n";
-    std::cout << "   OPTIMIZED BARNES-HUT (Corrected O(N log N))\n";
+    std::cout << "   OPTIMIZED BARNES-HUT \n";
     std::cout << "==================================================\n\n";
     
     std::cout << "Configuration:\n";
@@ -467,9 +463,7 @@ int main() {
         total_time += step_time;
         
         // Output progress
-        if (step % 10 == 0) {
-            // Bodies are already on host from step B (approximate) or we can copy fresh
-            // Ideally copy fresh if we want exact viz, but for speed we can skip strict sync
+        if (step % 1 == 0) {
             cudaMemcpy(h_bodies, d_bodies, N_BODIES * sizeof(Body), cudaMemcpyDeviceToHost); 
             saveData(h_bodies, N_BODIES, step, "optimized_output.txt");
             std::cout << "  Step " << step << ": " << step_time << " ms, Tree nodes: " << tree_size << "\n";
